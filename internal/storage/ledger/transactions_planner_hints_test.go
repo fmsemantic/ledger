@@ -109,6 +109,7 @@ func showSetting(t *testing.T, ctx context.Context, conn bun.IDB, name string) s
 // TestTransactionListAdaptive_FastPathUnchanged verifies that when the probe
 // succeeds within the timeout budget (dense wallet, or generous timeout), the
 // rows returned are identical to the plain store with no adaptive config.
+// Also exercises the "hook set but returns nil" path in paginateInTx.
 func TestTransactionListAdaptive_FastPathUnchanged(t *testing.T) {
 	t.Parallel()
 	ctx := logging.TestingContext()
@@ -120,6 +121,12 @@ func TestTransactionListAdaptive_FastPathUnchanged(t *testing.T) {
 		EnableAdaptiveFallback: true,
 		FirstAttemptTimeoutMs:  60_000,
 		RetryTimeoutMs:         60_000,
+	})
+
+	// A no-op hook exercises the "testHookBeforePaginateSelect != nil but returns nil"
+	// branch in paginateInTx — the path that falls through to the actual SELECT.
+	adaptive.SetTestHookBeforePaginateSelect(func(_ context.Context, _ bun.Tx) error {
+		return nil
 	})
 
 	q := walletQuery(15) // enough to return all 8 in one page
@@ -481,4 +488,94 @@ func TestTransactionListAdaptive_GetOneAndCountUnaffected(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.Equal(t, *cursor.Data[0].ID, *tx.ID)
+}
+
+// TestTransactionListAdaptive_FallbackRetrySucceedsViaPgSleep guarantees the
+// fallback fires deterministically (via pg_sleep on the probe) and the retry
+// succeeds (no artificial delay on the second paginateInTx call). This covers
+// the retry-success path in Paginate — the logging and return after a successful
+// GIN-override retry — which is NOT reliably reached by dataset-size-based tests
+// on fast CI runners where the probe's 1ms timeout may never fire.
+func TestTransactionListAdaptive_FallbackRetrySucceedsViaPgSleep(t *testing.T) {
+	t.Parallel()
+	ctx := logging.TestingContext()
+
+	base := setupHintsTestData(t, 8, 4)
+
+	adaptive := storeWithConfig(t, base, ledgerstore.TransactionListConfig{
+		EnableAdaptiveFallback: true,
+		FirstAttemptTimeoutMs:  1, // probe: hook makes this fire 57014
+		RetryTimeoutMs:         30_000,
+	})
+
+	// The hook fires on the probe (first paginateInTx call) and is a no-op on
+	// the retry (second call). Using context.Background() in the pg_sleep call
+	// prevents the Go context from racing against the Postgres statement_timeout.
+	callCount := 0
+	adaptive.SetTestHookBeforePaginateSelect(func(_ context.Context, tx bun.Tx) error {
+		callCount++
+		if callCount == 1 {
+			_, err := tx.ExecContext(context.Background(), "SELECT pg_sleep(0.005)")
+			return err // SQLSTATE 57014 → trigger fallback
+		}
+		return nil // retry: no delay → GIN scan succeeds
+	})
+
+	cursor, err := adaptive.Transactions().Paginate(ctx, walletQuery(15))
+	require.NoError(t, err, "retry with GIN override must succeed")
+	require.Len(t, cursor.Data, 8, "all 8 wallet rows must be returned")
+	require.False(t, cursor.HasMore, "8 rows < pageSize 15, no second page")
+	require.Equal(t, 2, callCount, "hook must have been called exactly twice (probe + retry)")
+}
+
+// TestTransactionListAdaptive_CtxCancelAfterProbe covers the edge case where
+// the probe fires SQLSTATE 57014 and the request context is cancelled at the
+// same moment (e.g. client disconnects). The implementation must NOT retry,
+// and must return the error rather than silently swallowing it.
+func TestTransactionListAdaptive_CtxCancelAfterProbe(t *testing.T) {
+	t.Parallel()
+
+	base := setupHintsTestData(t, 4, 2)
+
+	adaptive := storeWithConfig(t, base, ledgerstore.TransactionListConfig{
+		EnableAdaptiveFallback: true,
+		FirstAttemptTimeoutMs:  1,
+		RetryTimeoutMs:         30_000, // generous — retry must NOT run
+	})
+
+	ctx, cancel := context.WithCancel(logging.TestingContext())
+	defer cancel()
+
+	// The hook cancels the outer context (simulating a client disconnect that
+	// arrives just as the probe fires), then sleeps past the 1ms statement_timeout
+	// using context.Background() so the Go context cancellation cannot race ahead
+	// of the Postgres-side statement_timeout.
+	adaptive.SetTestHookBeforePaginateSelect(func(_ context.Context, tx bun.Tx) error {
+		cancel()
+		_, err := tx.ExecContext(context.Background(), "SELECT pg_sleep(0.005)")
+		return err // SQLSTATE 57014; ctx is now cancelled
+	})
+
+	_, err := adaptive.Transactions().Paginate(ctx, walletQuery(15))
+	require.Error(t, err, "must return an error when context is cancelled after probe timeout")
+}
+
+// TestTransactionListAdaptive_ZeroTimeoutNoSetLocal verifies that
+// FirstAttemptTimeoutMs = 0 skips the SET LOCAL statement_timeout entirely so
+// the probe runs without a server-side timeout. Also exercises
+// DefaultTransactionListConfig() and field override.
+func TestTransactionListAdaptive_ZeroTimeoutNoSetLocal(t *testing.T) {
+	t.Parallel()
+	ctx := logging.TestingContext()
+
+	base := setupHintsTestData(t, 4, 2)
+
+	// Start from the production defaults and only disable the probe timeout.
+	cfg := ledgerstore.DefaultTransactionListConfig()
+	cfg.FirstAttemptTimeoutMs = 0 // skip SET LOCAL statement_timeout for probe
+	adaptive := storeWithConfig(t, base, cfg)
+
+	cursor, err := adaptive.Transactions().Paginate(ctx, walletQuery(15))
+	require.NoError(t, err)
+	require.Len(t, cursor.Data, 4)
 }
