@@ -268,12 +268,14 @@ func (a *transactionsAdaptivePaginator) paginateInTx(
 	planOverride bool,
 ) (*paginate.Cursor[ledger.Transaction], error) {
 
-	// If the caller is already inside a bun.Tx (not the normal read path, but
-	// defensively handled), issue SET LOCAL directly rather than nesting.
-	if tx, ok := a.store.db.(bun.Tx); ok {
-		if err := a.issueSetLocal(ctx, tx, timeoutMs, planOverride); err != nil {
-			return nil, err
-		}
+	// If the caller is already inside a bun.Tx, skip the adaptive machinery
+	// and delegate directly to the base paginator.  We cannot safely
+	// probe-and-retry within someone else's transaction: SET LOCAL would scope
+	// to the OUTER transaction, and a 57014 timeout would put that outer
+	// transaction into an error state.  The caller would then receive a
+	// spurious "current transaction is aborted" error on the retry attempt and
+	// their transaction would be unusable.
+	if _, ok := a.store.db.(bun.Tx); ok {
 		return a.store.transactionsBase().Paginate(ctx, q)
 	}
 

@@ -371,8 +371,72 @@ func TestTransactionListAdaptive_PaginationCursorIntegrity(t *testing.T) {
 	}
 }
 
-// TestTransactionListAdaptive_GetOneAndCountUnaffected confirms that GetOne
-// and Count on an adaptive store return the same results as the base store.
+// TestTransactionListAdaptive_EmptyResultSet verifies that when the wallet
+// filter matches no transactions the adaptive path returns an empty cursor
+// without error.  An empty result set never triggers the probe timeout (the
+// query completes instantly), so this also exercises the fast path with a
+// zero-row response.
+func TestTransactionListAdaptive_EmptyResultSet(t *testing.T) {
+	t.Parallel()
+	ctx := logging.TestingContext()
+
+	// Populate only unrelated transactions so the wallet filter matches nothing.
+	base := setupHintsTestData(t, 0, 5)
+
+	adaptive := storeWithConfig(t, base, ledgerstore.TransactionListConfig{
+		EnableAdaptiveFallback: true,
+		FirstAttemptTimeoutMs:  5_000,
+		RetryTimeoutMs:         30_000,
+	})
+
+	cursor, err := adaptive.Transactions().Paginate(ctx, walletQuery(15))
+	require.NoError(t, err)
+	require.Empty(t, cursor.Data, "no wallet transactions → Data must be empty")
+	require.False(t, cursor.HasMore, "no wallet transactions → HasMore must be false")
+}
+
+// TestTransactionListAdaptive_AlreadyInTxSkipsAdaptive verifies that when the
+// store's DB is already a bun.Tx (i.e. the caller opened an outer transaction
+// via BeginTX), the adaptive paginator falls straight through to the base
+// repository without issuing any SET LOCAL statements.
+//
+// If it DID issue SET LOCAL on the outer transaction and the probe timed out,
+// the outer transaction would be left in an aborted state — a silent data hazard.
+// The safe contract is: adaptive machinery is skipped entirely within an outer tx.
+func TestTransactionListAdaptive_AlreadyInTxSkipsAdaptive(t *testing.T) {
+	t.Parallel()
+	ctx := logging.TestingContext()
+
+	base := setupHintsTestData(t, 5, 2)
+
+	// Build an adaptive store with a 1 ms probe — if the adaptive path ran
+	// inside the outer tx and SET LOCAL leaked, subsequent queries on the same
+	// tx would be killed by the 1 ms timeout.
+	adaptive := storeWithConfig(t, base, ledgerstore.TransactionListConfig{
+		EnableAdaptiveFallback: true,
+		FirstAttemptTimeoutMs:  1,
+		RetryTimeoutMs:         30_000,
+	})
+
+	// Open an outer transaction on the adaptive store.
+	txStore, tx, err := adaptive.BeginTX(ctx, nil)
+	require.NoError(t, err)
+	defer func() { _ = tx.Rollback() }()
+
+	// Paginate inside the outer transaction.  The adaptive machinery must be
+	// bypassed; if it were not, the 1 ms SET LOCAL would bleed into txStore and
+	// the query below (or the ROLLBACK) would time out.
+	cursor, err := txStore.Transactions().Paginate(ctx, walletQuery(15))
+	require.NoError(t, err, "Paginate inside outer tx must not corrupt the transaction")
+	require.Len(t, cursor.Data, 5)
+
+	// Prove the outer transaction is still usable — statement_timeout must not
+	// have been mutated to 1 ms.
+	var val string
+	require.NoError(t, tx.QueryRowContext(ctx, "SHOW statement_timeout").Scan(&val))
+	require.Equal(t, "0", val,
+		"statement_timeout must be the session default (0) — SET LOCAL must not have run on the outer tx")
+}
 func TestTransactionListAdaptive_GetOneAndCountUnaffected(t *testing.T) {
 	t.Parallel()
 	ctx := logging.TestingContext()
