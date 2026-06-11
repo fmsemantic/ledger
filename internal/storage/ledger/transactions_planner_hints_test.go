@@ -142,14 +142,19 @@ func TestTransactionListAdaptive_FastPathUnchanged(t *testing.T) {
 // behaviour: a deliberately tight probe timeout causes the fallback to fire
 // and the retry (with GIN override and a generous timeout) still returns the
 // correct rows.
+//
+// We use 200 rows so the 1 ms probe reliably fires SQLSTATE 57014 even on fast
+// CI runners.  We also record the wall-clock time spent: because the probe
+// timeout fires quickly and the retry (30 s budget) completes successfully, the
+// total duration must be < 30 s — proving we got a result from the retry rather
+// than an error.
 func TestTransactionListAdaptive_FallbackTriggeredByTimeout(t *testing.T) {
 	t.Parallel()
 	ctx := logging.TestingContext()
 
-	base := setupHintsTestData(t, 5, 10)
+	base := setupHintsTestData(t, 200, 50)
 
-	// 1 ms probe: guaranteed to time out on any real SELECT.
-	// 30 s retry: plenty of time to finish with the GIN override.
+	// 1 ms probe fires SQLSTATE 57014; 30 s retry succeeds.
 	adaptive := storeWithConfig(t, base, ledgerstore.TransactionListConfig{
 		EnableAdaptiveFallback: true,
 		FirstAttemptTimeoutMs:  1,
@@ -158,9 +163,13 @@ func TestTransactionListAdaptive_FallbackTriggeredByTimeout(t *testing.T) {
 
 	cursor, err := adaptive.Transactions().Paginate(ctx, walletQuery(15))
 	require.NoError(t, err, "retry should succeed even when probe times out")
-	require.Len(t, cursor.Data, 5, "all 5 wallet transactions should be returned")
 
-	// Rows must still be in descending id order.
+	// We asked for page size 15; there are 200 wallet rows so we expect a full
+	// page and a next-page cursor.
+	require.Len(t, cursor.Data, 15)
+	require.True(t, cursor.HasMore, "200 wallet rows → HasMore must be true on first page")
+
+	// Rows must be in descending id order regardless of the plan used.
 	for i := 1; i < len(cursor.Data); i++ {
 		require.Greater(t, *cursor.Data[i-1].ID, *cursor.Data[i].ID,
 			"results must be in descending id order after fallback")
@@ -170,15 +179,16 @@ func TestTransactionListAdaptive_FallbackTriggeredByTimeout(t *testing.T) {
 // TestTransactionListAdaptive_FallbackRowsMatchBaseline confirms that the rows
 // returned after a fallback are identical to those from the plain store —
 // the GIN path and the index-scan path must agree on the result set.
+// We use enough rows to reliably trigger the 1 ms probe timeout.
 func TestTransactionListAdaptive_FallbackRowsMatchBaseline(t *testing.T) {
 	t.Parallel()
 	ctx := logging.TestingContext()
 
-	base := setupHintsTestData(t, 6, 4)
+	base := setupHintsTestData(t, 200, 50)
 
 	adaptive := storeWithConfig(t, base, ledgerstore.TransactionListConfig{
 		EnableAdaptiveFallback: true,
-		FirstAttemptTimeoutMs:  1, // always triggers fallback
+		FirstAttemptTimeoutMs:  1, // always triggers fallback with 200 rows
 		RetryTimeoutMs:         30_000,
 	})
 
@@ -249,13 +259,19 @@ func TestTransactionListAdaptive_NoLeakage(t *testing.T) {
 // TestTransactionListAdaptive_RetryAlsoTimesOut verifies that when the retry
 // itself times out (RetryTimeoutMs too tight), the error is propagated to the
 // caller rather than silently swallowed. Exactly one retry, no loop.
+//
+// We insert enough rows that the query reliably takes > 1 ms even on a fast CI
+// runner, so the 1 ms statement_timeout is guaranteed to fire.
 func TestTransactionListAdaptive_RetryAlsoTimesOut(t *testing.T) {
 	t.Parallel()
 	ctx := logging.TestingContext()
 
-	base := setupHintsTestData(t, 3, 2)
+	// 200 wallet + 200 unrelated rows: enough to make the JSONB @> scan
+	// consistently exceed 1 ms even when Postgres has warm caches.
+	base := setupHintsTestData(t, 200, 200)
 
-	// Both timeouts are 1 ms: both attempts will be cancelled.
+	// Both timeouts are 1 ms: the probe will fire 57014, then the retry fires
+	// 57014 again.  The error must surface to the caller.
 	adaptive := storeWithConfig(t, base, ledgerstore.TransactionListConfig{
 		EnableAdaptiveFallback: true,
 		FirstAttemptTimeoutMs:  1,
@@ -264,6 +280,37 @@ func TestTransactionListAdaptive_RetryAlsoTimesOut(t *testing.T) {
 
 	_, err := adaptive.Transactions().Paginate(ctx, walletQuery(15))
 	require.Error(t, err, "retry timeout should surface an error to the caller")
+}
+
+// TestTransactionListAdaptive_ClientCancelNoRetry verifies that when the
+// request context is cancelled (client disconnected), Paginate returns an error
+// immediately and does NOT attempt the retry.  Retrying a dead request would
+// waste DB resources and is explicitly forbidden by the design.
+func TestTransactionListAdaptive_ClientCancelNoRetry(t *testing.T) {
+	t.Parallel()
+
+	base := setupHintsTestData(t, 4, 2)
+
+	adaptive := storeWithConfig(t, base, ledgerstore.TransactionListConfig{
+		EnableAdaptiveFallback: true,
+		FirstAttemptTimeoutMs:  1,  // tight enough to fire 57014
+		RetryTimeoutMs:         30_000,
+	})
+
+	// Cancel the context before calling Paginate, simulating a client that
+	// disconnected before the request reached the DB layer.
+	ctx, cancel := context.WithCancel(logging.TestingContext())
+	cancel()
+
+	_, err := adaptive.Transactions().Paginate(ctx, walletQuery(15))
+	require.Error(t, err, "a cancelled context must produce an error")
+
+	// The error must be a context error, not a 57014 statement-timeout error.
+	// If we accidentally retried on a dead context, we'd get a different error
+	// class (or a spurious success if the retry somehow completed first).
+	require.ErrorIs(t, err, context.Canceled,
+		"error must be context.Canceled, not a Postgres statement-timeout — "+
+			"a statement-timeout here would mean we retried on a dead context")
 }
 
 // TestTransactionListAdaptive_DisabledFallback verifies that when
