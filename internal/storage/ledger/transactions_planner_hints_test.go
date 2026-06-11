@@ -260,22 +260,31 @@ func TestTransactionListAdaptive_NoLeakage(t *testing.T) {
 // itself times out (RetryTimeoutMs too tight), the error is propagated to the
 // caller rather than silently swallowed. Exactly one retry, no loop.
 //
-// We insert enough rows that the query reliably takes > 1 ms even on a fast CI
-// runner, so the 1 ms statement_timeout is guaranteed to fire.
+// We cannot rely on dataset size to force SQLSTATE 57014: the GIN bitmap scan
+// used on the retry is fast by design, and on a warm CI runner even 200 rows
+// can complete in < 1 ms. Instead we install a test hook that runs
+// SELECT pg_sleep(0.005) inside paginateInTx after SET LOCAL, within the same
+// transaction. Because pg_sleep shares the statement_timeout scope it is
+// cancelled first, deterministically triggering SQLSTATE 57014 on both the
+// probe and the retry.
 func TestTransactionListAdaptive_RetryAlsoTimesOut(t *testing.T) {
 	t.Parallel()
 	ctx := logging.TestingContext()
 
-	// 200 wallet + 200 unrelated rows: enough to make the JSONB @> scan
-	// consistently exceed 1 ms even when Postgres has warm caches.
-	base := setupHintsTestData(t, 200, 200)
+	base := setupHintsTestData(t, 4, 2)
 
-	// Both timeouts are 1 ms: the probe will fire 57014, then the retry fires
-	// 57014 again.  The error must surface to the caller.
 	adaptive := storeWithConfig(t, base, ledgerstore.TransactionListConfig{
 		EnableAdaptiveFallback: true,
-		FirstAttemptTimeoutMs:  1,
+		FirstAttemptTimeoutMs:  1, // 1 ms; pg_sleep hook exceeds this deterministically
 		RetryTimeoutMs:         1,
+	})
+
+	// Sleep for 5 ms inside each paginateInTx attempt. With statement_timeout=1ms
+	// this always fires SQLSTATE 57014 before the sleep completes, regardless of
+	// how fast the underlying SELECT would have been.
+	adaptive.SetTestHookBeforePaginateSelect(func(ctx context.Context, tx bun.Tx) error {
+		_, err := tx.ExecContext(ctx, "SELECT pg_sleep(0.005)")
+		return err
 	})
 
 	_, err := adaptive.Transactions().Paginate(ctx, walletQuery(15))
@@ -293,7 +302,7 @@ func TestTransactionListAdaptive_ClientCancelNoRetry(t *testing.T) {
 
 	adaptive := storeWithConfig(t, base, ledgerstore.TransactionListConfig{
 		EnableAdaptiveFallback: true,
-		FirstAttemptTimeoutMs:  1,  // tight enough to fire 57014
+		FirstAttemptTimeoutMs:  1, // tight enough to fire 57014
 		RetryTimeoutMs:         30_000,
 	})
 

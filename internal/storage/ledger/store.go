@@ -112,9 +112,15 @@ type Store struct {
 
 	// Adaptive-fallback observability. Incremented/recorded only when a
 	// transactions-list probe attempt times out and triggers a retry.
-	txListFallbackCounter            metric.Int64Counter   // total fallback events
-	txListFirstAttemptDurationMs     metric.Int64Histogram // probe duration on fallback
-	txListRetryDurationMs            metric.Int64Histogram // retry duration on fallback
+	txListFallbackCounter        metric.Int64Counter   // total fallback events
+	txListFirstAttemptDurationMs metric.Int64Histogram // probe duration on fallback
+	txListRetryDurationMs        metric.Int64Histogram // retry duration on fallback
+
+	// testHookBeforePaginateSelect is called inside paginateInTx after SET LOCAL
+	// is issued but before the main SELECT. Nil in production. Tests set this to
+	// inject artificial latency (e.g. SELECT pg_sleep(0.005)) so that
+	// statement_timeout fires deterministically regardless of query execution speed.
+	testHookBeforePaginateSelect func(context.Context, bun.Tx) error
 }
 
 func (store *Store) Volumes() common.PaginatedResource[
@@ -151,6 +157,15 @@ func (store *Store) Transactions() common.PaginatedResource[ledger.Transaction, 
 		return store.transactionsBase()
 	}
 	return &transactionsAdaptivePaginator{store: store}
+}
+
+// SetTestHookBeforePaginateSelect sets a hook invoked inside paginateInTx after
+// SET LOCAL statements but before the main SELECT, sharing the same transaction.
+// The hook is subject to the same statement_timeout as the SELECT, so setting it
+// to SELECT pg_sleep(0.005) guarantees SQLSTATE 57014 fires within 1 ms regardless
+// of actual query speed. For tests only; nil in production.
+func (store *Store) SetTestHookBeforePaginateSelect(hook func(context.Context, bun.Tx) error) {
+	store.testHookBeforePaginateSelect = hook
 }
 
 // transactionsAdaptivePaginator is the heart of the sparse-wallet mitigation.
@@ -283,6 +298,15 @@ func (a *transactionsAdaptivePaginator) paginateInTx(
 	err := a.store.db.RunInTx(ctx, &sql.TxOptions{ReadOnly: true}, func(ctx context.Context, tx bun.Tx) error {
 		if err := a.issueSetLocal(ctx, tx, timeoutMs, planOverride); err != nil {
 			return err
+		}
+		// testHookBeforePaginateSelect runs inside the same transaction as the
+		// SELECT, so it is subject to the same SET LOCAL statement_timeout. In tests
+		// this is set to SELECT pg_sleep(N) to force SQLSTATE 57014 regardless of
+		// how fast the real query executes on the CI runner.
+		if a.store.testHookBeforePaginateSelect != nil {
+			if err := a.store.testHookBeforePaginateSelect(ctx, tx); err != nil {
+				return err
+			}
 		}
 		// Bind the base repository to this transaction connection so the SELECT
 		// shares the connection on which SET LOCAL was issued.
