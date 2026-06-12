@@ -550,7 +550,9 @@ func TestTransactionListAdaptive_CtxCancelAfterProbe(t *testing.T) {
 	// arrives just as the probe fires), then sleeps past the 1ms statement_timeout
 	// using context.Background() so the Go context cancellation cannot race ahead
 	// of the Postgres-side statement_timeout.
+	hookCalls := 0
 	adaptive.SetTestHookBeforePaginateSelect(func(_ context.Context, tx bun.Tx) error {
+		hookCalls++
 		cancel()
 		_, err := tx.ExecContext(context.Background(), "SELECT pg_sleep(0.005)")
 		return err // SQLSTATE 57014; ctx is now cancelled
@@ -558,6 +560,7 @@ func TestTransactionListAdaptive_CtxCancelAfterProbe(t *testing.T) {
 
 	_, err := adaptive.Transactions().Paginate(ctx, walletQuery(15))
 	require.Error(t, err, "must return an error when context is cancelled after probe timeout")
+	require.Equal(t, 1, hookCalls, "hook must be called exactly once — no retry after ctx cancel")
 }
 
 // TestTransactionListAdaptive_ZeroTimeoutNoSetLocal verifies that
